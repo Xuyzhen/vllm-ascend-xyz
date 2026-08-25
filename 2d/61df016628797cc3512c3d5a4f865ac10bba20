@@ -1,0 +1,12 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "2d61df016628797cc3512c3d5a4f865ac10bba20",
+  "prompts": {},
+  "humans": {
+    "h_a86b3638554f1b": {
+      "author": "Xuyzhen <958522639@qq.com>"
+    }
+  }
+}
