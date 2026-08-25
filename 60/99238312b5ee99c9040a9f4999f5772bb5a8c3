@@ -1,0 +1,44 @@
+tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_num_nans.py
+  s_1625c3fd8c0c00::t_084e8cfd72c4d7 3
+  s_1625c3fd8c0c00::t_b4abfc1665527e 78
+  s_1625c3fd8c0c00::t_2dab83a24ce329 75-77
+  s_1625c3fd8c0c00::t_afa12fa91f1086 79-81
+vllm_ascend/ops/triton/v2/metrics/docs/num_nans.md
+  s_1625c3fd8c0c00::t_a50986118ac6eb 97,99-108
+  s_1625c3fd8c0c00::t_501dbce1e0026d 114
+  s_1625c3fd8c0c00::t_e9131294a62b46 109-111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "6099238312b5ee99c9040a9f4999f5772bb5a8c3",
+  "prompts": {},
+  "humans": {
+    "h_a86b3638554f1b": {
+      "author": "Xuyzhen <958522639@qq.com>"
+    }
+  },
+  "sessions": {
+    "s_1625c3fd8c0c00": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a8d4c24494dbe186c05867c",
+        "model": "glm-5.3"
+      },
+      "human_author": "Xuyzhen <958522639@qq.com>",
+      "custom_attributes": {
+        "session_id": "6a8d4c24494dbe186c05867c",
+        "dedupe_key": "6a8d4c24494dbe186c05867c:6a8d567d494dbe186c058702:afterEdit:03c231aa",
+        "edit_kind": "file_edit",
+        "client_type": "ide",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "tool_type": "builtin",
+        "tool_use_id": "6a8d567d494dbe186c058702",
+        "operation_id": "6a8d567d494dbe186c058702",
+        "source_scene": "agent",
+        "runtime_client": "trae-tob-git-ai",
+        "external_session_id": "6a8d4c24494dbe186c05867c"
+      }
+    }
+  }
+}
