@@ -1,0 +1,42 @@
+tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_num_nans_kernel.py
+  s_463d12948ac49c::t_87730646749e05 24-26,28,31-36,41,50-54,58,60,75-78,80,82,97-100,102,104
+tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_num_nans_kernel_standalone.py
+  s_463d12948ac49c::t_57e58421ad6382 1-17
+  s_463d12948ac49c::t_56a58fbef7f221 97,107
+  s_463d12948ac49c::t_978367209fd91f 44
+  s_463d12948ac49c::t_43a75bde855249 135-137
+  s_463d12948ac49c::t_6d91cd0ed1ed70 18-20,41-43
+  s_463d12948ac49c::t_4460935c713af8 45-47,94-96
+  s_463d12948ac49c::t_6316e54936d722 98-100,104-106
+  s_463d12948ac49c::t_d2accf2727f0b3 108-110,132-134
+  s_463d12948ac49c::t_9dba5ef471cf94 138-140
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "2750018c374cabd8b6819f67d483e9c0a6539343",
+  "prompts": {},
+  "sessions": {
+    "s_463d12948ac49c": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a869c6c494dbe186c0574a2",
+        "model": "glm-5.3"
+      },
+      "human_author": "Xuyzhen <958522639@qq.com>",
+      "custom_attributes": {
+        "external_session_id": "6a869c6c494dbe186c0574a2",
+        "operation_id": "6a8cf6fe494dbe186c0583ef",
+        "runtime_client": "trae-tob-git-ai",
+        "source_scene": "agent",
+        "tool_use_id": "6a8cf6fe494dbe186c0583ef",
+        "tool_type": "builtin",
+        "session_id": "6a869c6c494dbe186c0574a2",
+        "dedupe_key": "6a869c6c494dbe186c0574a2:6a8cf6fe494dbe186c0583ef:afterEdit:f61ac94f",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "edit_kind": "file_edit",
+        "client_type": "ide"
+      }
+    }
+  }
+}
