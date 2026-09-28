@@ -41,39 +41,52 @@ def _pad_to_ep_local_size(x: torch.Tensor, max_local_size: int) -> torch.Tensor:
 
 
 def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor) -> torch.Tensor:
-    """仅用于 EP 通信场景：EP all_gather + 按 DP token 分布 unpad。"""
+    """仅用于 EP 通信场景：EP all_gather + 按 DP token 分布 unpad。
+
+    v2 (rc1 sp_by_pass 还原): MoE 全程运行在 padded 布局上。输入 pad 到
+    max_local_size 后 all_gather, 直接返回原始 gathered tensor (不做 unpad)。
+    不平衡分片产生的多余 pad 行会被 MoE 计算后在 reduce 侧丢弃; 快 rank
+    在 pad 行上浪费的 FLOPs 墙钟上免费 -- 它本来就要在集合通信处等慢 rank。
+    换来的是完全消除 per-shard python 切片循环和 cat 的 host 开销
+    (每 MoE 层 3 次 gather 调用, 61 层 prefill 热路径)。
+    """
     forward_context = get_forward_context()
     dp_metadata = forward_context.dp_metadata
     ep_group = get_ep_group()
     local_sizes = _get_ep_local_sizes(dp_metadata, ep_group)
     if local_sizes is not None:
         max_local_size = max(local_sizes)
-        # all_gather 要求各 rank 输入等长：先 pad 到 max_local_size，
-        # gather 后再按各 rank 真实的 local_sizes 截回。
+        # all_gather 要求各 rank 输入等长: pad 到 max_local_size。
+        # 等分片时 _pad_to_ep_local_size 零开销原样返回。
         x = _pad_to_ep_local_size(x, max_local_size)
+        # 直接返回 padded 布局 (rc1 sp_by_pass 语义), 不做 unpad。
+        return ep_group.all_gather(x, 0).view(len(local_sizes) * max_local_size, *x.shape[1:])
+
     # need to unpad from ep size
     x = ep_group.all_gather(x, 0)
     if dp_metadata is not None:
-        if local_sizes is not None:
-            x = x.view(len(local_sizes), max(local_sizes), *x.shape[1:])
-            x = torch.cat([x[idx, :size] for idx, size in enumerate(local_sizes)], dim=0)
-        else:
-            num_tokens_across_dp_cpu = dp_metadata.num_tokens_across_dp_cpu
-            result = torch.empty((num_tokens_across_dp_cpu.sum(), *x.shape[1:]), device=x.device, dtype=x.dtype)
-            dp_size = get_dp_group().world_size
-            x = x.view(dp_size, _EXTRA_CTX.padded_length, *x.shape[1:])
-            offset = 0
-            for idx in range(dp_size):
-                num_tokens_dp = int(num_tokens_across_dp_cpu[idx])
-                result[offset : offset + num_tokens_dp] = x[idx, :num_tokens_dp]
-                offset += num_tokens_dp
-            x = result
+        num_tokens_across_dp_cpu = dp_metadata.num_tokens_across_dp_cpu
+        result = torch.empty((num_tokens_across_dp_cpu.sum(), *x.shape[1:]), device=x.device, dtype=x.dtype)
+        dp_size = get_dp_group().world_size
+        x = x.view(dp_size, _EXTRA_CTX.padded_length, *x.shape[1:])
+        offset = 0
+        for idx in range(dp_size):
+            num_tokens_dp = int(num_tokens_across_dp_cpu[idx])
+            result[offset : offset + num_tokens_dp] = x[idx, :num_tokens_dp]
+            offset += num_tokens_dp
+        x = result
 
     return x
 
 
 def _maybe_pad_and_reduce_impl(x: torch.Tensor) -> torch.Tensor:
-    """仅用于 EP 通信场景：按 DP token 分布 pad 后做 EP reduce_scatter。"""
+    """仅用于 EP 通信场景：按 DP token 分布 pad 后做 EP reduce_scatter。
+
+    v2 (rc1 sp_by_pass 还原): gather 侧已保持 padded 布局 (每 rank 分片 =
+    max_local_size, 真实 token 在前 pad 在后), reduce 输入天然就是
+    (ep_size, max_local_size, ...) 的连续布局 -- 直接 view 后 reduce_scatter,
+    零分配零拷贝, 输出 slice 回本 rank 真实 token 数即可。
+    """
     forward_context = get_forward_context()
 
     if _EXTRA_CTX.is_draft_model and is_vl_model():
@@ -86,13 +99,9 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor) -> torch.Tensor:
     ep_group = get_ep_group()
     local_sizes = _get_ep_local_sizes(dp_metadata, ep_group)
     if local_sizes is not None:
-        max_local_size = max(local_sizes)
-        padded_x = x.new_zeros((len(local_sizes), max_local_size, *x.shape[1:]))
-        offset = 0
-        for idx, size in enumerate(local_sizes):
-            padded_x[idx, :size] = x[offset : offset + size]
-            offset += size
-        reduced = ep_group.reduce_scatter(padded_x.view(-1, *x.shape[1:]), 0)
+        # 与 v2 gather 配对: x 行数 = len(local_sizes) * max(local_sizes),
+        # 每 rank 的真实 token 位于其分片头部, pad 尾部会被 slice 丢弃。
+        reduced = ep_group.reduce_scatter(x.view(-1, *x.shape[1:]), 0)
         # The collective needs equal-sized chunks, while the next
         # sequence-parallel layer expects this rank's original token count.
         return reduced[: local_sizes[ep_group.rank_in_group]]
@@ -115,7 +124,8 @@ def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor) -> torch.Tensor:
     ep_group = get_ep_group()
     local_sizes = _get_ep_local_sizes(forward_context.dp_metadata, ep_group)
     if local_sizes is not None:
-        return torch.empty((sum(local_sizes), *x.shape[1:]), device=x.device, dtype=x.dtype)
+        # 与 v2 gather impl 对齐: 输出为 padded 布局 (每分片 max_local_size)。
+        return torch.empty((len(local_sizes) * max(local_sizes), *x.shape[1:]), device=x.device, dtype=x.dtype)
 
     return torch.empty((x.shape[0] * ep_group.world_size, *x.shape[1:]), device=x.device, dtype=x.dtype)
 
