@@ -511,6 +511,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             # each local expert GMM, after the AlltoAll exchange.
             with_quant = False
         dst_type = token_dispatch_input.quant.get_dst_type
+        scale_type = token_dispatch_input.quant.get_scale_type
         hidden_states = token_dispatch_input.hidden_states
         topk_weights = token_dispatch_input.topk_weights
         topk_ids = token_dispatch_input.topk_ids
@@ -559,6 +560,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
                 global_input_tokens_local_experts_indices,
                 with_quant,
                 dst_type,
+                scale_type,
             )
         )
 
@@ -687,6 +689,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         global_input_tokens_local_experts_indices,
         with_quant,
         dst_type,
+        scale_type,
     ):
         # Early return if no local experts or no tokens
         if self.num_local_experts <= 1:
@@ -697,17 +700,26 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         )
 
         if with_quant:
-            global_input_tokens, reversed_global_input_permutation_mapping, _, dynamic_scale_after_all2all = (
+            scale_for_routing = dynamic_scale_after_all2all
+            if scale_type == torch.float8_e8m0fnu:
+                scale_for_routing = scale_for_routing.view(torch.float8_e8m0fnu)
+            global_input_tokens, reversed_global_input_permutation_mapping, _, routed_scale = (
                 torch_npu.npu_moe_init_routing_v2(
                     global_input_tokens,
                     global_input_tokens_local_experts_indices.unsqueeze(-1),
-                    scale=dynamic_scale_after_all2all,
-                    expert_num=self.num_experts,
+                    scale=scale_for_routing,
+                    active_num=global_input_tokens_local_experts_indices.shape[0],
+                    expert_num=self.num_local_experts,
+                    expert_tokens_num_type=1,
                     expert_tokens_num_flag=True,
                     active_expert_range=[0, self.num_local_experts],
                     x_dtype=dst_type,
                 )
             )
+            if scale_type == torch.float8_e8m0fnu:
+                dynamic_scale_after_all2all = routed_scale.view(torch.uint8)
+            else:
+                dynamic_scale_after_all2all = routed_scale
         else:
             global_input_tokens, reversed_global_input_permutation_mapping = torch_npu.npu_moe_token_permute(
                 global_input_tokens, global_input_tokens_local_experts_indices
