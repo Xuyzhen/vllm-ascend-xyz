@@ -55,6 +55,12 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor) -> torch.Tensor:
     x = ep_group.all_gather(x, 0)
     if dp_metadata is not None:
         if local_sizes is not None:
+            # Fast path: every rank contributed exactly max_local_size real
+            # tokens, so the gathered tensor is already the exact unpadded
+            # layout -- a pure view beats cat-of-slices (no host allocs,
+            # no per-shard slicing; this is the common balanced-DP case).
+            if all(size == max_local_size for size in local_sizes):
+                return x.view(len(local_sizes) * max_local_size, *x.shape[1:])
             x = x.view(len(local_sizes), max(local_sizes), *x.shape[1:])
             x = torch.cat([x[idx, :size] for idx, size in enumerate(local_sizes)], dim=0)
         else:
@@ -87,6 +93,13 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor) -> torch.Tensor:
     local_sizes = _get_ep_local_sizes(dp_metadata, ep_group)
     if local_sizes is not None:
         max_local_size = max(local_sizes)
+        # Fast path: equal shard sizes mean x is already laid out exactly as
+        # (ep_size, max_local_size, ...) requires -- reduce_scatter directly on
+        # a view. Skips the per-shard pad buffer (new_zeros), the python
+        # scatter loop and the trailing slice; output size already equals
+        # this rank's local size (common balanced-DP case).
+        if all(size == max_local_size for size in local_sizes):
+            return ep_group.reduce_scatter(x.view(-1, *x.shape[1:]), 0)
         padded_x = x.new_zeros((len(local_sizes), max_local_size, *x.shape[1:]))
         offset = 0
         for idx, size in enumerate(local_sizes):
