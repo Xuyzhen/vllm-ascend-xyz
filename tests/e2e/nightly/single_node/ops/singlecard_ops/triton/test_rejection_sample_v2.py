@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,6 +11,7 @@ from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
 from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.hardware import AscendDeviceType
+from vllm_ascend.worker.v2.spec_decode import rejection_sampler_utils as rejection_utils
 from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import rejection_sample
 
 VOCAB_SIZE = 4096
@@ -70,6 +72,102 @@ def _build_rejection_sample_inputs(
         temperature=temp_tensor,
         seed=seed,
     )
+
+
+def _build_ragged_rejection_sample_inputs(lengths: list[int], vocab_size: int = 128) -> dict:
+    """Build deterministic ragged requests with at most three draft tokens."""
+    device = "npu"
+    num_reqs = len(lengths)
+    num_logits = sum(lengths)
+    num_speculative_steps = 3
+    logits = torch.full((num_reqs, vocab_size), -20.0, device=device)
+    logits[torch.arange(num_reqs, device=device), torch.arange(1, num_reqs + 1, device=device)] = 20.0
+    expanded_idx_mapping = torch.repeat_interleave(
+        torch.arange(num_reqs, dtype=torch.int32), torch.tensor(lengths, dtype=torch.int32)
+    ).to(device)
+    expanded_local_pos = torch.cat([torch.arange(length, dtype=torch.int32) for length in lengths]).to(device)
+    cu_num_logits = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
+    draft_sampled = torch.repeat_interleave(
+        torch.arange(1, num_reqs + 1, dtype=torch.int64, device=device),
+        torch.tensor(lengths, device=device),
+    )
+    return dict(
+        target_logits=logits[expanded_idx_mapping.long()].contiguous(),
+        draft_logits=logits[:, None, :].expand(-1, num_speculative_steps, -1).contiguous(),
+        draft_sampled=draft_sampled,
+        cu_num_logits=cu_num_logits,
+        pos=torch.arange(num_logits, dtype=torch.int32, device=device),
+        idx_mapping=torch.arange(num_reqs, dtype=torch.int32, device=device),
+        expanded_idx_mapping=expanded_idx_mapping,
+        expanded_local_pos=expanded_local_pos,
+        temperature=torch.ones(num_reqs, device=device),
+        seed=torch.arange(num_reqs, dtype=torch.int64, device=device),
+    )
+
+
+@pytest.mark.skipif(
+    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5),
+    reason="Requires Ascend A2/A3/A5",
+)
+@torch.inference_mode()
+def test_draft_logits_cache_row_mapping():
+    """A sharded cache must be equivalent to the same logits in request-slot order."""
+    if "draft_logits_row_mapping_ptr" not in rejection_utils._compute_block_stats_kernel.arg_names:
+        pytest.skip("The installed vLLM does not yet provide DraftLogitsCache row mapping")
+
+    inputs = _build_ragged_rejection_sample_inputs([4, 3, 2])
+    logical_values = inputs["draft_logits"]
+    row_mapping = torch.tensor([2, 0, 1], dtype=torch.int32, device="npu")
+    physical_values = torch.empty_like(logical_values)
+    physical_values[row_mapping.long()] = logical_values
+    mapped_inputs = dict(inputs)
+    mapped_inputs["draft_logits"] = SimpleNamespace(values=physical_values, row_mapping=row_mapping)
+
+    expected, expected_counts = rejection_sample(
+        **inputs, num_speculative_steps=3, use_block_verification=True
+    )
+    actual, actual_counts = rejection_sample(
+        **mapped_inputs, num_speculative_steps=3, use_block_verification=True
+    )
+
+    torch.testing.assert_close(actual_counts, expected_counts)
+    valid = torch.arange(4, device="npu")[None, :] < actual_counts[:, None]
+    torch.testing.assert_close(actual[valid], expected[valid])
+
+
+@pytest.mark.skipif(
+    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5),
+    reason="Requires Ascend A2/A3/A5",
+)
+@torch.inference_mode()
+def test_num_logits_reuses_logits_stats_kernels(monkeypatch):
+    """15/16/17 logits must share both MRV2 logits-stat kernel binaries."""
+    named_kernels = (
+        ("logits_stats", rejection_utils._compute_block_stats_kernel),
+        ("residual_mass", rejection_utils._compute_local_residual_mass_kernel),
+    )
+    if "num_logits" not in named_kernels[0][1].arg_names:
+        pytest.skip("The installed vLLM predates the dynamic num_logits kernel API")
+    for _, kernel in named_kernels:
+        assert "num_logits" in kernel.do_not_specialize
+
+    compile_events = {name: [] for name, _ in named_kernels}
+    for name, kernel in named_kernels:
+        original_compile = kernel._do_compile
+
+        def record_compile(*args, _name=name, _compile=original_compile, **kwargs):
+            compile_events[_name].append(args[0])
+            return _compile(*args, **kwargs)
+
+        monkeypatch.setattr(kernel, "_do_compile", record_compile)
+
+    for index, lengths in enumerate(([4, 4, 4, 3], [4, 4, 4, 4], [4, 4, 4, 4, 1])):
+        inputs = _build_ragged_rejection_sample_inputs(lengths)
+        rejection_sample(**inputs, num_speculative_steps=3, use_block_verification=True)
+        if index == 0:
+            warm_compile_counts = {name: len(events) for name, events in compile_events.items()}
+        else:
+            assert {name: len(events) for name, events in compile_events.items()} == warm_compile_counts
 
 
 @pytest.mark.skipif(

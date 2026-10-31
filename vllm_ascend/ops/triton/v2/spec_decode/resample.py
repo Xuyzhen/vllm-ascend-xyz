@@ -12,6 +12,14 @@ from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_
 _RESAMPLE_BLOCK_SIZE = 1024
 
 
+@triton.jit
+def _draft_logits_row(req_state_idx, row_mapping_ptr):
+    row = req_state_idx
+    if row_mapping_ptr is not None:
+        row = tl.load(row_mapping_ptr + req_state_idx, mask=req_state_idx >= 0, other=-1)
+    return row.to(tl.int64)
+
+
 def _get_vectorcore_num() -> int:
     try:
         return int(get_vectorcore_num())
@@ -30,6 +38,7 @@ def _get_vectorcore_num() -> int:
         "expanded_idx_mapping_ptr",
         "draft_sampled_ptr",
         "temp_ptr",
+        "draft_logits_row_mapping_ptr",
     ],
 )
 def _resample_kernel(
@@ -45,6 +54,7 @@ def _resample_kernel(
     draft_logits_ptr,
     draft_logits_stride_0,
     draft_logits_stride_1,
+    draft_logits_row_mapping_ptr,
     draft_rejected_logsumexp_ptr,
     rejected_step_ptr,
     cu_num_logits_ptr,
@@ -80,6 +90,7 @@ def _resample_kernel(
         end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
         resample_token_idx = start_idx + resample_idx
         req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx).to(tl.int64)
+        draft_row = _draft_logits_row(req_state_idx, draft_logits_row_mapping_ptr)
         temperature = tl.load(temp_ptr + req_state_idx).to(tl.float32)
         is_bonus = resample_token_idx == end_idx - 1
         needs_resample = (temperature != 0.0) | is_bonus
@@ -117,7 +128,7 @@ def _resample_kernel(
                 if HAS_DRAFT_LOGITS:
                     draft_block_logits = tl.load(
                         draft_logits_ptr
-                        + req_state_idx * draft_logits_stride_0
+                        + tl.maximum(draft_row, 0) * draft_logits_stride_0
                         + resample_idx * draft_logits_stride_1
                         + vocab_offsets,
                         mask=vocab_mask,
@@ -154,6 +165,7 @@ def _resample_kernel(
         "temp_ptr",
         "seed_ptr",
         "pos_ptr",
+        "draft_logits_row_mapping_ptr",
     ],
 )
 def _categorical_finalize_kernel(
@@ -172,6 +184,7 @@ def _categorical_finalize_kernel(
     draft_logits_ptr,
     draft_logits_stride_0,
     draft_logits_stride_1,
+    draft_logits_row_mapping_ptr,
     draft_rejected_logsumexp_ptr,
     rejected_step_ptr,
     cu_num_logits_ptr,
@@ -199,6 +212,7 @@ def _categorical_finalize_kernel(
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
     resample_token_idx = start_idx + resample_idx
     req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx).to(tl.int64)
+    draft_row = _draft_logits_row(req_state_idx, draft_logits_row_mapping_ptr)
 
     temperature = tl.load(temp_ptr + req_state_idx).to(tl.float32)
     is_greedy = temperature == 0.0
@@ -307,7 +321,10 @@ def _categorical_finalize_kernel(
 
     if HAS_DRAFT_LOGITS:
         draft_block_logits = tl.load(
-            draft_logits_ptr + req_state_idx * draft_logits_stride_0 + resample_idx * draft_logits_stride_1 + token_ids,
+            draft_logits_ptr
+            + tl.maximum(draft_row, 0) * draft_logits_stride_0
+            + resample_idx * draft_logits_stride_1
+            + token_ids,
             mask=valid_token_mask & is_random_residual & has_total_mass,
             other=float("-inf"),
         ).to(tl.float32)
@@ -359,6 +376,7 @@ def resample(
     seed: torch.Tensor,
     pos: torch.Tensor,
     has_draft_logits: bool | None = None,
+    draft_logits_row_mapping: torch.Tensor | None = None,
     cumulative_log_p: torch.Tensor | None = None,
     use_block_verification: bool = False,
 ) -> None:
@@ -372,6 +390,8 @@ def resample(
 
     ``draft_logits`` contains raw cached logits; draft logsumexp statistics
     must include temperature scaling, as in the verification path.
+    ``draft_logits_row_mapping`` maps persistent request-state slots to
+    physical rows when the cache is sharded; ``None`` selects identity mapping.
 
     ``target_logits`` and full ``draft_logits`` support fp16, bf16, and fp32;
     probability-mass arithmetic is fp32. Their vocabulary dimension must be
@@ -430,6 +450,7 @@ def resample(
         draft_logits,
         draft_logits.stride(0),
         draft_logits.stride(1),
+        draft_logits_row_mapping,
         draft_rejected_logsumexp,
         num_sampled,
         cu_num_logits,
@@ -462,6 +483,7 @@ def resample(
         draft_logits,
         draft_logits.stride(0),
         draft_logits.stride(1),
+        draft_logits_row_mapping,
         draft_rejected_logsumexp,
         num_sampled,
         cu_num_logits,

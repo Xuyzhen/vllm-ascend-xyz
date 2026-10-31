@@ -17,6 +17,8 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
+from typing import Protocol
+
 import torch
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
@@ -32,7 +34,20 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
 )
 
 from vllm_ascend.ops.triton.v2.spec_decode.resample import resample
-from vllm_ascend.utils import vllm_version_is
+
+
+class _DraftLogitsCache(Protocol):
+    values: torch.Tensor
+    row_mapping: torch.Tensor | None
+
+
+@triton.jit
+def _draft_logits_row(req_state_idx, row_mapping_ptr):
+    """Return the physical draft-cache row for a request-state slot."""
+    row = req_state_idx
+    if row_mapping_ptr is not None:
+        row = tl.load(row_mapping_ptr + req_state_idx, mask=req_state_idx >= 0, other=-1)
+    return row.to(tl.int64)
 
 
 @triton.jit
@@ -64,6 +79,7 @@ def _probabilistic_rejection_kernel(
     draft_logits_ptr,
     draft_logits_stride_0,
     draft_logits_stride_1,
+    draft_logits_row_mapping_ptr,
     # [num_logits, num_blocks]
     draft_local_max_ptr,
     draft_local_max_stride,
@@ -98,6 +114,7 @@ def _probabilistic_rejection_kernel(
     # offsets in int32, which overflows when num_logits exceeds INT32_MAX
     # (upstream vllm #46560).
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
+    draft_row = _draft_logits_row(req_state_idx, draft_logits_row_mapping_ptr)
     start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
     num_tokens = end_idx - start_idx
@@ -216,7 +233,7 @@ def _probabilistic_rejection_kernel(
                 if HAS_DRAFT_LOGITS:
                     draft_logit = tl.load(
                         draft_logits_ptr
-                        + req_state_idx * draft_logits_stride_0
+                        + tl.maximum(draft_row, 0) * draft_logits_stride_0
                         + i * draft_logits_stride_1
                         + draft_sampled
                     ).to(tl.float32)
@@ -280,7 +297,7 @@ def rejection_sample(
     # [num_logits, V]
     target_logits: torch.Tensor,
     # [max_num_reqs, num_speculative_steps, V]
-    draft_logits: torch.Tensor | None,
+    draft_logits: torch.Tensor | _DraftLogitsCache | None,
     # [num_logits]
     draft_sampled: torch.Tensor,
     # [num_reqs + 1]
@@ -334,6 +351,10 @@ def rejection_sample(
     num_reqs = cu_num_logits.shape[0] - 1
     num_logits, vocab_size = target_logits.shape
     has_draft_logits = draft_logits is not None
+    draft_logits_row_mapping = None
+    if draft_logits is not None and not isinstance(draft_logits, torch.Tensor):
+        draft_logits_row_mapping = draft_logits.row_mapping
+        draft_logits = draft_logits.values
 
     # vLLM main renamed the `num_speculative_steps` argument of the logits-stats
     # kernels to `num_logits` and moved bonus-token detection into
@@ -342,7 +363,13 @@ def rejection_sample(
     # logit after the first one as a bonus token and return early, leaving the
     # `new_empty` block-statistics buffers uninitialized. v0.32.0 still expects
     # `num_speculative_steps`.
-    stats_num_logits = num_speculative_steps if vllm_version_is("0.32.0") else num_logits
+    # Detect the imported kernel contract directly instead of inferring it from
+    # vLLM's package version. Downstream builds can backport the new Python
+    # kernel API without changing ``vllm.__version__``.
+    legacy_stats_kernel_api = (
+        "draft_logits_row_mapping_ptr" not in _compute_block_stats_kernel.arg_names
+    )
+    stats_num_logits = num_speculative_steps if legacy_stats_kernel_api else num_logits
 
     if draft_logits is None:
         # When draft_logits is None, create a dummy tensor so that Triton
@@ -365,7 +392,7 @@ def rejection_sample(
     target_local_sumexp = target_logits.new_empty(num_logits, vocab_num_blocks, dtype=torch.float32)
     draft_local_max = target_logits.new_empty(num_logits, vocab_num_blocks, dtype=torch.float32)
     draft_local_sumexp = target_logits.new_empty(num_logits, vocab_num_blocks, dtype=torch.float32)
-    _compute_block_stats_kernel[(num_logits, vocab_num_blocks)](
+    block_stats_args = (
         target_local_argmax,
         target_local_argmax.stride(0),
         target_local_max,
@@ -381,11 +408,18 @@ def rejection_sample(
         draft_logits,
         draft_logits.stride(0),
         draft_logits.stride(1),
+    )
+    if not legacy_stats_kernel_api:
+        block_stats_args += (draft_logits_row_mapping,)
+    block_stats_args += (
         expanded_idx_mapping,
         expanded_local_pos,
         temperature,
         vocab_size,
         stats_num_logits,
+    )
+    _compute_block_stats_kernel[(num_logits, vocab_num_blocks)](
+        *block_stats_args,
         BLOCK_SIZE=VOCAB_BLOCK_SIZE,
         HAS_DRAFT_LOGITS=has_draft_logits,
         # TODO: Remove this workaround after the Triton Ascend AutoBlockify
@@ -395,7 +429,7 @@ def rejection_sample(
 
     if use_block_verification:
         cumulative_log_p = target_logits.new_empty(num_logits, dtype=torch.float32)
-        _compute_cumulative_log_p_kernel[(num_reqs,)](
+        cumulative_log_p_args = (
             cumulative_log_p,
             target_logits,
             target_logits.stride(0),
@@ -407,6 +441,10 @@ def rejection_sample(
             draft_logits,
             draft_logits.stride(0),
             draft_logits.stride(1),
+        )
+        if not legacy_stats_kernel_api:
+            cumulative_log_p_args += (draft_logits_row_mapping,)
+        cumulative_log_p_args += (
             draft_local_max,
             draft_local_max.stride(0),
             draft_local_sumexp,
@@ -415,6 +453,9 @@ def rejection_sample(
             idx_mapping,
             temperature,
             vocab_num_blocks,
+        )
+        _compute_cumulative_log_p_kernel[(num_reqs,)](
+            *cumulative_log_p_args,
             PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
             HAS_DRAFT_LOGITS=has_draft_logits,
             num_warps=1,
@@ -422,7 +463,7 @@ def rejection_sample(
         if has_draft_logits:
             local_residual_mass = target_logits.new_empty(num_logits, vocab_num_blocks, dtype=torch.float32)
             if num_logits > 1:
-                _compute_local_residual_mass_kernel[(num_logits - 1, vocab_num_blocks)](
+                residual_mass_args = (
                     local_residual_mass,
                     local_residual_mass.stride(0),
                     cumulative_log_p,
@@ -435,6 +476,10 @@ def rejection_sample(
                     draft_logits,
                     draft_logits.stride(0),
                     draft_logits.stride(1),
+                )
+                if not legacy_stats_kernel_api:
+                    residual_mass_args += (draft_logits_row_mapping,)
+                residual_mass_args += (
                     draft_local_max,
                     draft_local_max.stride(0),
                     draft_local_sumexp,
@@ -446,6 +491,9 @@ def rejection_sample(
                     vocab_size,
                     stats_num_logits,
                     vocab_num_blocks,
+                )
+                _compute_local_residual_mass_kernel[(num_logits - 1, vocab_num_blocks)](
+                    *residual_mass_args,
                     BLOCK_SIZE=VOCAB_BLOCK_SIZE,
                     PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
                 )
@@ -479,6 +527,7 @@ def rejection_sample(
         draft_logits,
         draft_logits.stride(0),
         draft_logits.stride(1),
+        draft_logits_row_mapping,
         draft_local_max,
         draft_local_max.stride(0),
         draft_local_sumexp,
@@ -515,6 +564,7 @@ def rejection_sample(
         seed,
         pos,
         has_draft_logits=has_draft_logits,
+        draft_logits_row_mapping=draft_logits_row_mapping,
         cumulative_log_p=cumulative_log_p,
         use_block_verification=use_block_verification,
     )

@@ -10,6 +10,7 @@ import torch
 from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
 
 from vllm_ascend.worker.v2.spec_decode import init_speculator
+from vllm_ascend.worker.v2.spec_decode import rejection_sampler_utils as rejection_utils
 from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import rejection_sample
 
 
@@ -31,6 +32,49 @@ def test_rejection_sample_rejects_block_with_synthetic_rates():
             synthetic_conditional_rates=torch.ones(1),
             use_block_verification=True,
         )
+
+
+def test_rejection_sample_forwards_draft_cache_row_mapping(monkeypatch):
+    """The sharded draft-cache mapping must reach every logits reader."""
+
+    class KernelRecorder:
+        def __init__(self):
+            self.calls = []
+            self.arg_names = ["draft_logits_row_mapping_ptr"]
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                self.calls.append((grid, args, kwargs))
+
+            return launch
+
+    block_stats = KernelRecorder()
+    rejection = KernelRecorder()
+    resample = MagicMock()
+    monkeypatch.setattr(rejection_utils, "_compute_block_stats_kernel", block_stats)
+    monkeypatch.setattr(rejection_utils, "_probabilistic_rejection_kernel", rejection)
+    monkeypatch.setattr(rejection_utils, "resample", resample)
+    values = torch.zeros(2, 1, 4)
+    row_mapping = torch.tensor([1, 0], dtype=torch.int32)
+    draft_cache = SimpleNamespace(values=values, row_mapping=row_mapping)
+    rejection_sample(
+        target_logits=torch.zeros(4, 4),
+        draft_logits=draft_cache,
+        draft_sampled=torch.tensor([0, 1, 0, 1]),
+        cu_num_logits=torch.tensor([0, 2, 4], dtype=torch.int32),
+        pos=torch.arange(4, dtype=torch.int32),
+        idx_mapping=torch.arange(2, dtype=torch.int32),
+        expanded_idx_mapping=torch.tensor([0, 0, 1, 1], dtype=torch.int32),
+        expanded_local_pos=torch.tensor([0, 1, 0, 1], dtype=torch.int32),
+        temperature=torch.ones(2),
+        seed=torch.zeros(2, dtype=torch.int64),
+        num_speculative_steps=1,
+    )
+
+    assert block_stats.calls[0][1][15] is row_mapping
+    assert rejection.calls[0][1][17] is row_mapping
+    assert resample.call_args.kwargs["draft_logits_row_mapping"] is row_mapping
+    assert resample.call_args.args[4] is values
 
 
 def _make_config(
