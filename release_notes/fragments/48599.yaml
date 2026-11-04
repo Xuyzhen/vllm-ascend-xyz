@@ -1,0 +1,4 @@
+pr: 48599
+entries:
+  - category: bugfix
+    text: Fixed environment validation on Ascend to accept registered plugin variables while continuing to reject unknown VLLM_ names.

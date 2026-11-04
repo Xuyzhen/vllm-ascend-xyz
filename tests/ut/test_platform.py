@@ -1,4 +1,5 @@
 import importlib
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -32,6 +33,36 @@ from vllm_ascend.utils import (
     AscendDeviceType,
     dsv4_skips_indexer_topk,
 )
+
+
+@pytest.mark.parametrize("hard_fail", [False, True])
+def test_validate_environ_accepts_registered_names(hard_fail):
+    with (
+        patch.dict(
+            os.environ,
+            {"VLLM_LOGGING_LEVEL": "INFO", "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": "1", "OTHER": "1"},
+            clear=True,
+        ),
+        patch("vllm_ascend.platform.logger.warning") as warning,
+    ):
+        NPUPlatform.validate_environ(hard_fail)
+    warning.assert_not_called()
+
+
+@pytest.mark.parametrize("name", ["VLLM_ASCEND_ENABLE_BATCH_MEMCPY_TYPO", "VLLM_UNKNOWN_TEST_ENV"])
+@pytest.mark.parametrize("hard_fail", [False, True])
+def test_validate_environ_rejects_unknown_names(name, hard_fail):
+    with (
+        patch.dict(os.environ, {name: "1"}, clear=True),
+        patch("vllm_ascend.platform.logger.warning") as warning,
+    ):
+        if hard_fail:
+            with pytest.raises(ValueError, match=f"Unknown vLLM environment variable detected: {name}"):
+                NPUPlatform.validate_environ(hard_fail)
+            warning.assert_not_called()
+        else:
+            NPUPlatform.validate_environ(hard_fail)
+            warning.assert_called_once_with("Unknown vLLM environment variable detected: %s", name)
 
 
 @pytest.mark.parametrize(

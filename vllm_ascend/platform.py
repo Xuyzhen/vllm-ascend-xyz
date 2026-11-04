@@ -29,6 +29,8 @@ import vllm.envs as envs_vllm
 from vllm.logger import logger
 from vllm.platforms import Platform, PlatformEnum
 
+from vllm_ascend import envs as envs_ascend
+
 # todo: please remove it when solve cuda hard code in vllm
 os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
@@ -112,6 +114,19 @@ class NPUPlatform(Platform):
         "modelopt_mxfp8",
         "mxfp8",
     ]
+
+    @classmethod
+    def validate_environ(cls, hard_fail: bool) -> None:
+        """Validate names registered by vLLM or the Ascend plugin."""
+        for env in os.environ:
+            if (
+                env.startswith("VLLM_")
+                and env not in envs_vllm.environment_variables
+                and env not in envs_ascend.env_variables
+            ):
+                if hard_fail:
+                    raise ValueError(f"Unknown vLLM environment variable detected: {env}")
+                logger.warning("Unknown vLLM environment variable detected: %s", env)
 
     @property
     def pass_key(self) -> str:
