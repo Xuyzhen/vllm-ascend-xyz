@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from vllm.config import utils as config_utils
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
@@ -795,17 +796,27 @@ def test_update_decode_attn_metadata_mla_with_dcp():
     assert torch.equal(metadata.seq_lens_cpu, expected)
 
 
-def test_eplb_draft_mask_tracks_prefill_decode_and_dummy_replay():
+def test_eplb_draft_mask_tracks_prefill_decode_and_dummy_replay(monkeypatch):
     speculator = AscendTargetDependentARSpeculator.__new__(AscendTargetDependentARSpeculator)
     speculator.input_buffers = SimpleNamespace(is_padding=torch.zeros(8, dtype=torch.bool))
     speculator._eplb_source_is_padding = None
     speculator._eplb_dummy_run = False
-    speculator.speculative_config = SimpleNamespace(draft_model_config=SimpleNamespace(compute_hash=lambda: "draft"))
+    draft_config = SimpleNamespace(max_model_len=32768)
+    draft_config.compile_factors = lambda: {"max_model_len": draft_config.max_model_len}
+    upstream_key = getattr(config_utils, "hash_config_cached", None)
+    if upstream_key is None:
+        draft_config.compute_hash = lambda: "draft"
+        draft_key = "draft"
+    else:
+        monkeypatch.setattr(config_utils, "_config_hash_cache", {})
+        draft_key = upstream_key(draft_config)
+        draft_config.max_model_len = 16384
+    speculator.speculative_config = SimpleNamespace(draft_model_config=draft_config)
     layer_state = SimpleNamespace()
     state = SimpleNamespace(
         allgather_record_tensor=torch.tensor(-1),
         model_states={
-            "draft": SimpleNamespace(model=SimpleNamespace(moe_layers=[SimpleNamespace(eplb_state=layer_state)]))
+            draft_key: SimpleNamespace(model=SimpleNamespace(moe_layers=[SimpleNamespace(eplb_state=layer_state)]))
         },
     )
     speculator.set_eplb_state(state)

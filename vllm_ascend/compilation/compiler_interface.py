@@ -19,6 +19,7 @@ import copy
 import functools
 import os
 from collections.abc import Callable
+from hashlib import sha256
 from typing import Any, cast
 
 import torch
@@ -272,22 +273,25 @@ class AscendCompiler(CompilerInterface):
 
     name = "AscendCompiler"
 
-    # TODO(wxs): add passes related to compilation in compute_hash
-    def compute_hash(self, vllm_config: VllmConfig) -> str:
-        self.vllm_config = vllm_config
-        ascend_compilation_config = get_ascend_config().ascend_compilation_config
-        from hashlib import sha256
-
+    def compile_factors(self, vllm_config: VllmConfig) -> dict[str, object]:
         import torch_npu
 
-        factors = {
+        self.vllm_config = vllm_config
+        ascend_compilation_config = get_ascend_config().ascend_compilation_config
+        return {
             "torch_npu_version": torch_npu.__version__,
             "enable_npugraph_ex": ascend_compilation_config.enable_npugraph_ex,
             "enable_static_kernel": ascend_compilation_config.enable_static_kernel,
             "enable_super_kernel": ascend_compilation_config.enable_super_kernel,
         }
-        logger.info("AscendCompiler hash factors: %s", factors)
-        return sha256(str(factors).encode(), usedforsecurity=False).hexdigest()[:10]
+
+    # Newer CompilerInterface rejects subclasses which define compute_hash.
+    if hasattr(CompilerInterface, "compute_hash"):
+
+        def compute_hash(self, vllm_config: VllmConfig) -> str:
+            factors = self.compile_factors(vllm_config)
+            logger.info("AscendCompiler hash factors: %s", factors)
+            return sha256(str(factors).encode(), usedforsecurity=False).hexdigest()[:10]
 
     def initialize_cache(self, cache_dir: str, disable_cache: bool = False, prefix: str = "") -> None:
         """Initialize cache settings and runtime state before compiling or loading a graph."""

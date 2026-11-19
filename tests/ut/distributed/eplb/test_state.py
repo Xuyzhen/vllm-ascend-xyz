@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from vllm.config import utils as config_utils
 from vllm.distributed.eplb import eplb_state as upstream_eplb_state
 
 from vllm_ascend.ascend_config import StairConfig
@@ -21,15 +22,23 @@ from vllm_ascend.distributed.eplb.eplb_state import (
 from vllm_ascend.distributed.eplb.policy.stair import StairEplbPolicy
 
 
-def test_update_mapping_refreshes_ascend_routing_without_replacing_state():
+@pytest.fixture
+def registered_model_config(monkeypatch):
+    monkeypatch.setattr(config_utils, "_config_hash_cache", {})
+    factors = {"model": "target"}
+    config = SimpleNamespace(compute_hash=lambda: "target", compile_factors=lambda: factors)
+    key = config_utils.hash_factors(factors) if hasattr(config_utils, "hash_config_cached") else "target"
+    return config, key
+
+
+def test_update_mapping_refreshes_ascend_routing_without_replacing_state(registered_model_config):
     state = AscendEplbState.__new__(AscendEplbState)
     state._hixl_session = None
     state._close_error = None
     state._suspended = False
-    model_config = MagicMock()
-    model_config.compute_hash.return_value = "target"
+    model_config, key = registered_model_config
     model_state = object()
-    state.model_states = {"target": model_state}
+    state.model_states = {key: model_state}
     mapping = torch.tensor([[1, 0]], dtype=torch.int32)
     events = []
     with (
@@ -44,7 +53,7 @@ def test_update_mapping_refreshes_ascend_routing_without_replacing_state():
     update.assert_called_once_with(model_config, mapping)
     refresh.assert_called_once_with(model_state)
     assert events == ["update", "refresh"]
-    assert state.model_states["target"] is model_state
+    assert state.model_states[key] is model_state
 
 
 def test_uses_upstream_policy_and_async_worker_lifecycle():
@@ -204,7 +213,7 @@ def test_a5_common_table_refreshes_in_place_and_invalidates_only_changed_layout(
 
 
 @pytest.mark.parametrize("device", [AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5])
-def test_add_model_snapshots_the_placement_on_every_profile(monkeypatch, device):
+def test_add_model_snapshots_the_placement_on_every_profile(monkeypatch, device, registered_model_config):
     """Every profile needs the snapshot, not only the AllGather one.
 
     `refresh_model_routing_tables` compares against it to notice a committed
@@ -214,22 +223,55 @@ def test_add_model_snapshots_the_placement_on_every_profile(monkeypatch, device)
     monkeypatch.setattr(eplb_state, "get_current_hardware_profile", lambda: get_hardware_profile(device))
     monkeypatch.setattr(eplb_state, "get_ep_group", lambda: SimpleNamespace(world_size=2))
     monkeypatch.setattr(upstream_eplb_state.EplbState, "add_model", lambda *_, **__: None)
-    model_config = MagicMock()
-    model_config.compute_hash.return_value = "target"
+    model_config, key = registered_model_config
     physical = torch.tensor([[0, 1, 0, 1]])
 
     state = AscendEplbState.__new__(AscendEplbState)
     state._hixl_session = None
     state._configured_policy = None
     state.parallel_config = SimpleNamespace(eplb_config=SimpleNamespace(policy="default"))
-    state.model_states = {"target": SimpleNamespace(physical_to_logical_map=physical)}
+    state.model_states = {key: SimpleNamespace(physical_to_logical_map=physical)}
     monkeypatch.setattr(AscendEplbState, "uses_custom_load_stats", property(lambda _: False))
 
     state.add_model(object(), model_config)
 
-    snapshot = state.model_states["target"]._allgather_physical_map
+    snapshot = state.model_states[key]._allgather_physical_map
     torch.testing.assert_close(snapshot, physical)
     assert snapshot is not physical
+
+
+@pytest.mark.skipif(not hasattr(config_utils, "hash_config_cached"), reason="requires vLLM's cached EPLB registration")
+def test_forward_updates_registered_model_state_after_auto_fit(monkeypatch):
+    monkeypatch.setattr(config_utils, "_config_hash_cache", {})
+    upstream_key = getattr(config_utils, "hash_config_cached", None)
+    assert upstream_key is not None
+    model_config = SimpleNamespace(max_model_len=32768)
+    model_config.compile_factors = lambda: {"max_model_len": model_config.max_model_len}
+    model_state = SimpleNamespace(
+        physical_to_logical_map=torch.tensor([[0, 1]]),
+        num_unpadded_tokens_tensors=[torch.zeros(1, dtype=torch.int32)],
+    )
+
+    # Skip expert/communicator setup, but use the same key as upstream registration.
+    def register(self, model, config, model_name=None):
+        self.model_states[upstream_key(config)] = model_state
+
+    monkeypatch.setattr(upstream_eplb_state.EplbState, "add_model", register)
+    monkeypatch.setattr(eplb_state, "get_ep_group", lambda: SimpleNamespace(world_size=2))
+    state = AscendEplbState.__new__(AscendEplbState)
+    state._hixl_session = None
+    state._configured_policy = None
+    state.parallel_config = SimpleNamespace(eplb_config=SimpleNamespace(policy="default"))
+    state.model_states = {}
+
+    state.add_model(object(), model_config)
+    (registration_key,) = state.model_states
+    model_config.max_model_len = 16384
+    assert config_utils.hash_factors(model_config.compile_factors()) != registration_key
+    state.prepare_forward(model_config, 7)
+
+    assert state.model_states == {registration_key: model_state}
+    assert model_state.num_unpadded_tokens_tensors[0].tolist() == [7]
 
 
 def test_first_commit_discards_load_history_on_a_non_allgather_profile():

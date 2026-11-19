@@ -16,6 +16,7 @@ from numpy.typing import NDArray
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
 
 # isort: split
+from vllm.config import utils as config_utils
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, SlidingWindowSpec, UniformTypeKVCacheSpecs
 
 from tests.ut.distributed.ascend_store.test_mooncake_hybrid import MemoryRangeStore, cpu_cache
@@ -301,8 +302,10 @@ class TestMooncakePipeline(unittest.TestCase):
             cache_dtype: str = "fp8"
 
             def compute_hash(self):
-                # Upstream CacheConfig.compute_hash includes block_size.
                 return f"{self.block_size}:{self.cache_dtype}"
+
+            def compile_factors(self):
+                return {"block_size": self.block_size, "cache_dtype": self.cache_dtype}
 
         worker, _ = self.make_stage(0, MemoryRangeStore())
         config = worker.vllm_config
@@ -313,6 +316,24 @@ class TestMooncakePipeline(unittest.TestCase):
         self.assertEqual(original, protocol.layerwise_topology_namespace(config, worker.kv_cache_config))
         config.cache_config.cache_dtype = "bfloat16"
         self.assertNotEqual(original, protocol.layerwise_topology_namespace(config, worker.kv_cache_config))
+
+    def test_namespace_tracks_current_speculative_config(self):
+        worker, _ = self.make_stage(0, MemoryRangeStore())
+        config = worker.vllm_config
+        speculative = SimpleNamespace(draft_model="draft-a")
+        if hasattr(config_utils, "hash_config"):
+            del config.model_config.compute_hash
+            del config.cache_config.compute_hash
+            speculative.compile_factors = lambda: {"draft_model": speculative.draft_model}
+        else:
+            speculative.compute_hash = lambda: speculative.draft_model
+
+        without_draft = protocol.layerwise_topology_namespace(config)
+        config.speculative_config = speculative
+        with_draft = protocol.layerwise_topology_namespace(config)
+        self.assertNotEqual(without_draft, with_draft)
+        speculative.draft_model = "draft-b"
+        self.assertNotEqual(with_draft, protocol.layerwise_topology_namespace(config))
 
     def test_nonzero_stage_uses_local_group_indices(self):
         worker, _ = self.make_stage(1, MemoryRangeStore())
@@ -383,8 +404,10 @@ class TestMooncakePipeline(unittest.TestCase):
         self.assertNotEqual(original, protocol.layerwise_topology_namespace(config))
         config.cache_config.cache_dtype = "auto"
         config.model_config.compute_hash.return_value = "different-model-or-attention-config"
+        config.model_config.compile_factors.return_value = {"model": "different-model-or-attention-config"}
         self.assertNotEqual(original, protocol.layerwise_topology_namespace(config))
         config.model_config.compute_hash.return_value = "test-model-config"
+        config.model_config.compile_factors.return_value = {"model": "test-model-config"}
         config.model_config.get_layers_start_end_indices.side_effect = lambda p: ((0, 4), (4, 7))[p.rank // 2]
         self.assertNotEqual(original, protocol.layerwise_topology_namespace(config))
         groups = worker.kv_cache_config.kv_cache_groups

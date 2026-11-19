@@ -164,7 +164,9 @@ def make_worker(
         )
         config.model_config.get_total_num_hidden_layers.return_value = sum(pp_partition)
         config.model_config.compute_hash.return_value = "test-model-config"
+        config.model_config.compile_factors.return_value = {"model": "test-model-config"}
         config.cache_config.compute_hash.return_value = "test-cache-config"
+        config.cache_config.compile_factors.return_value = {"cache": "test-cache-config"}
         config.cache_config.cache_dtype = "auto"
         config.speculative_config = None
     config.additional_config = {"enable_kvpp": use_kvpp}

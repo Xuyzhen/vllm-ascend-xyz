@@ -14,6 +14,7 @@ from vllm.logger import logger
 from vllm.v1.kv_cache_interface import MambaSpec, SlidingWindowSpec, UniformTypeKVCacheSpecs
 
 from vllm_ascend.ascend_config import KVPPConfig
+from vllm_ascend.config_hash import hash_config
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ReqMeta,
@@ -85,8 +86,8 @@ def layerwise_topology_namespace(vllm_config: Any, kv_cache_config: Any = None) 
         raise ValueError("Mooncake PP partitions must cover every model layer")
     # EngineCore rewrites its CacheConfig.block_size to the minimum group
     # block size after spawning workers. Workers still hold the CLI value
-    # (e.g. 32 while a DSV4 state group uses 2). Hashing either the raw value
-    # or CacheConfig.compute_hash() would split lookup and PUT namespaces.
+    # (e.g. 32 while a DSV4 state group uses 2). Hashing the unnormalized
+    # config would split lookup and PUT namespaces.
     # Normalize a copy from the resolved groups shared by both roles; never
     # change the worker's config, which model/cache code still needs.
     cache = copy(vllm_config.cache_config)
@@ -98,11 +99,11 @@ def layerwise_topology_namespace(vllm_config: Any, kv_cache_config: Any = None) 
     identity: tuple[Any, ...] = (
         parallel.tensor_parallel_size,
         partitions,
-        model.compute_hash(),
-        cache.compute_hash(),
+        hash_config(model),
+        hash_config(cache),
         cache.cache_dtype,
         cache.block_size,
-        speculative.compute_hash() if speculative is not None else None,
+        hash_config(speculative) if speculative is not None else None,
     )
     if kvpp_namespace:
         identity += (kvpp_namespace,)
