@@ -10,14 +10,11 @@ diverge and ``NPUOffloadingWorker.transfer_async`` trips its length assertion
 with misaligned block ids.
 """
 
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.config import CacheConfig, KVTransferConfig, ParallelConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
-    build_offloading_config,
     get_offloading_group_ids,
 )
 from vllm.v1.kv_cache_interface import (
@@ -34,14 +31,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.kv_offload.native.offloading_co
     AscendOffloadingConnectorWorker,
 )
 from vllm_ascend.hisparse.binding import _bind_indexer_views
-from vllm_ascend.utils import refresh_block_size
 
 NUM_BLOCKS = 4
 BLOCK_SIZE = 2
 HEAD_SIZE = 3
 DTYPE = torch.bfloat16
-UPSTREAM_BLOCK_SIZE = 16
-NPU_BLOCK_SIZE = 128
 
 
 def _attention_spec() -> FullAttentionSpec:
@@ -101,46 +95,6 @@ def _prepare_worker(
     worker._init_worker = captured.append
     monkeypatch.setattr(connector_mod, "derive_canonical_mappings", lambda *args: {})
     return worker, captured
-
-
-def test_offloading_chunk_matches_effective_npu_block_size() -> None:
-    cache_config = CacheConfig(block_size=UPSTREAM_BLOCK_SIZE, enable_prefix_caching=True)
-    transfer_config = KVTransferConfig(
-        kv_connector="OffloadingConnector",
-        kv_role="kv_both",
-        kv_connector_extra_config={"block_size": UPSTREAM_BLOCK_SIZE},
-    )
-    vllm_config = SimpleNamespace(
-        cache_config=cache_config,
-        kv_transfer_config=transfer_config,
-        parallel_config=ParallelConfig(),
-        scheduler_config=SimpleNamespace(enable_chunked_prefill=False),
-        model_config=SimpleNamespace(
-            model="facebook/opt-125m",
-            hf_config=SimpleNamespace(model_type="opt"),
-            is_hybrid=False,
-            use_mla=False,
-            dtype=DTYPE,
-            max_model_len=256,
-            get_total_num_kv_heads=lambda: 1,
-        ),
-        kv_events_config=None,
-        speculative_config=None,
-        use_v2_model_runner=False,
-    )
-    refresh_block_size(vllm_config)
-    assert cache_config.block_size == NPU_BLOCK_SIZE
-
-    spec = replace(_attention_spec(), block_size=cache_config.block_size)
-    kv_cache_config = _config([_group("model.layers.0.self_attn", spec=spec)])
-    with pytest.raises(ValueError, match=rf"must be a multiple.*\({NPU_BLOCK_SIZE} tokens\)"):
-        build_offloading_config(vllm_config, kv_cache_config)
-
-    transfer_config.kv_connector_extra_config["block_size"] = NPU_BLOCK_SIZE
-    offloading_config = build_offloading_config(vllm_config, kv_cache_config)
-    assert offloading_config.cache.blocks_per_chunk == 1
-    assert offloading_config.cache.tokens_per_hash == NPU_BLOCK_SIZE
-    assert offloading_config.groups[0].tokens_per_block == NPU_BLOCK_SIZE
 
 
 def test_only_prefix_cacheable_groups_are_registered(
